@@ -324,8 +324,59 @@ def usage_source(name, ctx, device):
     return "NOT DEFINED"
 
 
-def derive_switch(ctx, device, stats_ports):
-    """Return one dict per physical port with the resolved config for that port."""
+def dynamic_profiles(dynamic_usage, usages):
+    """Profiles a dynamic port profile's rules can assign at runtime (e.g. LLDP says Mist AP)."""
+    if not dynamic_usage:
+        return set()
+    return {r.get("usage") for r in (usages.get(dynamic_usage) or {}).get("rules") or [] if r.get("usage")}
+
+
+def switch_members(device, status_entry):
+    """[(fpc, model)] for each chassis / Virtual Chassis member.
+
+    Combines the members the switch last reported (device stats module_stat,
+    which has each member's model) with the VC members in its config (a member
+    that is down or offline may only be in one of them), else a single member 0."""
+    members = {}
+    for m in (status_entry.get("module_stat") or []):
+        if m.get("type", "fpc") == "fpc" and m.get("fpc_idx") is not None:
+            members[int(m["fpc_idx"])] = m.get("model") or device.get("model")
+    for m in ((device.get("virtual_chassis") or {}).get("members") or []):
+        fpc = m.get("member_id", m.get("member"))
+        if fpc is not None:
+            members.setdefault(int(fpc), m.get("model") or device.get("model"))
+    return sorted(members.items())
+
+
+def hardware_ports(members, models):
+    """Port names that can exist on this switch, from Mist's device model catalogue.
+
+    Returns (valid, base): every valid interface name per member (a slot can have
+    several, e.g. ge-/xe- on an SFP+ uplink), and the fixed PIC 0 ports to list
+    even when the switch reports nothing. valid is None if any member's model is
+    unknown, in which case no ports are filtered out."""
+    valid, base = set(), []
+    for fpc, model in members:
+        spec = ((models.get(model) or {}).get("defaults") or {}).get("_ports")
+        if not spec:
+            return None, []
+        seen_slots = set()
+        for port in expand_ports(spec):
+            m = PHYSICAL_PORT.match(port)
+            if not m:
+                continue
+            name = f"{m.group(1)}-{fpc}/{m.group(3)}/{m.group(4)}"
+            valid.add(name)
+            slot = (m.group(3), m.group(4))
+            if m.group(3) == "0" and slot not in seen_slots:
+                seen_slots.add(slot)
+                base.append(name)
+    return valid, base
+
+
+def derive_switch(ctx, device, stats_ports, members, models):
+    """Return one dict per physical port with the resolved config for that port,
+    plus the matched rule and the number of configured ports that don't exist."""
     usages = {**SYSTEM_USAGES, **ctx.usages, **(device.get("port_usages") or {})}
     networks = {**SYSTEM_NETWORKS, **ctx.networks, **(device.get("networks") or {})}
     var_map = {**ctx.vars, **(device.get("vars") or {})}
@@ -353,7 +404,31 @@ def derive_switch(ctx, device, stats_ports):
             base = assigned.get(port, ({}, ""))[0]
             assigned[port] = ({**base, **entry}, "Local port config")
 
-    ports = set(p for p in stats_ports if PHYSICAL_PORT.match(p)) | set(p for p in assigned if PHYSICAL_PORT.match(p))
+    # Templates often use blanket ranges (e.g. mge-0/0/0-47 ... mge-7/0/0-47) for
+    # every switch. Mist still writes config for ports the hardware doesn't have,
+    # but they aren't real ports, so drop any that aren't valid for the switch's
+    # VC members and their models.
+    # Slots with nothing configured or reported are listed under their first
+    # name in the model catalogue.
+    if not members:
+        # Nothing known about the switch's members (never reported, no VC
+        # config): keep member 0 plus any member the switch's own port config
+        # refers to. Template/rule ranges are ignored here - they're often
+        # blanket ranges (mge-0/0/0-47 ... mge-7/0/0-47) shared by every switch.
+        own = [p for spec in list(device.get("port_config") or {}) + list(device.get("local_port_config") or {})
+               for p in expand_ports(spec)]
+        fpcs = {PHYSICAL_PORT.match(p).group(2) for p in own if PHYSICAL_PORT.match(p)} | {"0"}
+        members = [(int(f), device.get("model")) for f in fpcs]
+    valid, base = hardware_ports(members, models)
+    live_ports = set(p for p in stats_ports if PHYSICAL_PORT.match(p))
+    configured = set(p for p in assigned if PHYSICAL_PORT.match(p))
+    not_present = 0
+    if valid is not None:
+        not_present = len(configured - valid - live_ports)
+        configured &= valid | live_ports
+    ports = live_ports | configured
+    taken = {(m.group(2), m.group(3), m.group(4)) for m in map(PHYSICAL_PORT.match, ports)}
+    ports |= {p for p in base if PHYSICAL_PORT.match(p).group(2, 3, 4) not in taken}
 
     def vlan(name, warnings):
         if not name:
@@ -450,8 +525,9 @@ def derive_switch(ctx, device, stats_ports):
             "critical": bool(entry.get("critical")),
             "description": description,
             "warnings": "; ".join(dict.fromkeys(warnings)),
+            "dynamic_profiles": dynamic_profiles(entry.get("dynamic_usage"), usages),
         })
-    return rows, rule
+    return rows, rule, not_present
 
 
 # --------------------------------------------------------------------------
@@ -581,7 +657,13 @@ NOTES = [
     ("   that VLAN out of the Junos config), or a port listed in more than one port config entry. In that", None),
     ("   last case Mist applies the entry whose port list sorts last alphabetically, not the one listed last.", None),
     ("Live ... columns - from the switch's port stats. 'Switch offline' = no current stats for the switch;", None),
-    ("   'Port not reported by switch' usually means the port is configured but doesn't physically exist.", None),
+    ("   'Not reported by switch' = a port that exists on the hardware but isn't in the switch's stats.", None),
+    ("   'OK (dynamic)' = the port has a dynamic profile and the switch assigned one of its profiles (e.g. LLDP", None),
+    ("   saw a Mist AP). 'Dynamic (set on switch)' = Mist leaves dynamic ports out of the static Junos config.", None),
+    ("Ports listed - every port that exists on each switch (Mist device model catalogue + Virtual Chassis", None),
+    ("   members). Configured ranges covering ports the hardware doesn't have (e.g. mge-7/0/0-47 on a", None),
+    ("   single switch) are left out - Mist still pushes config for them, but they aren't physical ports.", None),
+    ("   The Switches sheet counts them per switch.", None),
     ("Junos Profile / Junos Check - the profile Mist actually applied in the Junos config it generated", None),
     ("   for that switch (GET /devices/{id}/config_cmd). MISMATCH rows are highlighted red.", None),
     ("Live Usage Check - compares the derived profile with the profile the switch reports in its stats.", None),
@@ -634,6 +716,7 @@ def main():
     print("Fetching sites, switch templates and switch status...")
     sites = api_get_pages(f"/orgs/{ORG_ID}/sites", "sites")
     templates = {t["id"]: t for t in api_get_pages(f"/orgs/{ORG_ID}/networktemplates", "templates")}
+    models = {m.get("model"): m for m in api_get("/const/device_models", "device models")}
     status = {d.get("mac"): d for d in api_get_pages(f"/orgs/{ORG_ID}/stats/devices?type=switch", "device stats")}
     print(f"  {len(sites)} sites, {len(templates)} switch templates, {len(status)} switches with stats")
 
@@ -669,7 +752,7 @@ def main():
         mac = dev.get("mac", "")
         st = status.get(mac, {})
         live = port_stats.get(mac, {})
-        rows, rule = derive_switch(ctx, dev, live.keys())
+        rows, rule, not_present = derive_switch(ctx, dev, live.keys(), switch_members(dev, st), models)
 
         junos, junos_ae = None, {}
         if idx in check_set:
@@ -687,19 +770,29 @@ def main():
             live_usage = lp.get("port_usage") or ""
             if not lp:
                 live_check = ("Switch offline" if st.get("status") != "connected"
-                              else "Port not reported by switch")
+                              else "Not reported by switch (e.g. empty SFP slot)")
             elif not live_usage:
                 live_check = "Not reported"
             else:
-                live_check = "OK" if live_usage == row["usage"] else "MISMATCH"
+                if live_usage == row["usage"]:
+                    live_check = "OK"
+                elif live_usage in row["dynamic_profiles"]:
+                    live_check = "OK (dynamic)"
+                else:
+                    live_check = "MISMATCH"
             if junos is None:
                 junos_usage, junos_check = "", "Not checked"
             else:
                 junos_usage = junos.get(row["port"], "")
                 if not junos_usage:
-                    junos_check = "Not in Junos"
+                    # Ports with a dynamic profile are left out of the static Junos
+                    # config; the switch assigns their profile itself at runtime.
+                    junos_check = "Dynamic (set on switch)" if row["dynamic_usage"] else "Not in Junos"
+                elif junos_usage == row["usage"] or junos_usage.startswith(row["usage"] + "-") and row["usage"] == "inet":
+                    # L3 "inet" ports get a per-site group name, e.g. inet-fW4OnAdD.
+                    junos_check = "OK"
                 else:
-                    junos_check = "OK" if junos_usage == row["usage"] else "MISMATCH"
+                    junos_check = "MISMATCH"
                 if row["lag"] == "ae (auto)" and junos_ae.get(row["port"]):
                     # No ae_idx configured - Mist picks one; show the one it chose.
                     row["lag"] = f"{junos_ae[row['port']]} (auto)"
@@ -752,7 +845,7 @@ def main():
             sum(v for k, v in counts.items() if k.startswith("Rule default") or k.startswith("System default")),
             sum(v for k, v in counts.items() if k.startswith("Rule port config")),
             counts["Switch port config"], counts["Local port config"], counts["overrides"],
-            len(dev.get("port_usages") or {}), len(dev.get("networks") or {}),
+            not_present, len(dev.get("port_usages") or {}), len(dev.get("networks") or {}),
             "Yes" if junos is not None else "", counts["junos_mismatch"] if junos is not None else "",
             counts["live_mismatch"], counts["warnings"],
         ])
@@ -789,10 +882,10 @@ def main():
         "Site", "Switch Template", "Switch Name", "Switch MAC", "Model", "Role", "Switch Status",
         "VC Members", "Matched Rule", "Rule Source", "Rule Default Profile", "Ports", "Ports Up",
         "Ports On Rule Default", "Ports Set By Rule", "Ports Set On Switch", "Ports Set Locally",
-        "Ports With Overrides", "Switch-Level Profiles", "Switch-Level Networks",
+        "Ports With Overrides", "Configured Ports Not On Hardware", "Switch-Level Profiles", "Switch-Level Networks",
         "Junos Checked", "Junos Mismatches", "Live Mismatches", "Ports With Warnings",
     ], switch_rows, "375623",
-        highlight=lambda r: RED_FILL if r[21] else AMBER_FILL if r[22] or r[23] else None)
+        highlight=lambda r: RED_FILL if r[22] else AMBER_FILL if r[23] or r[24] else None)
 
     ws = wb.create_sheet("Issues")
     write_table(ws, ["Site", "Switch Name", "Switch MAC", "Port", "Issue", "Derived Profile", "Assigned By",

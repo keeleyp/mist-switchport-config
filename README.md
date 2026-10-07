@@ -26,6 +26,17 @@ The script resolves the rest itself:
   Chassis member.
 - Built-in profiles are understood: `default`, `disabled`, `ap`, `uplink`,
   `iot`, `inet` and `evpn_*`.
+- Ports are limited to those that exist on the hardware. The script uses Mist's
+  device model catalogue (`/const/device_models`) and each switch's Virtual
+  Chassis members, so it works for offline switches too. Blanket template ranges
+  such as `mge-0/0/0-47 ... mge-7/0/0-47` don't create phantom rows. Mist still
+  pushes config for those ports, and the Switches sheet counts them.
+- Dynamic port profiles are understood. Mist leaves those ports out of the
+  static Junos config, and the switch assigns them a profile at runtime (e.g.
+  `access-point` when LLDP sees a Mist AP).
+- Switch matching rules support `match_role`, slice matches such as
+  `match_name[9:17]` / `match_model[0:6]`, and the older `match_name` +
+  `match_name_offset` form.
 - When the same port appears in more than one `port_config` entry, Mist applies
   the entry whose key **sorts last alphabetically**, not the one listed last.
   This was confirmed against the generated Junos, and these ports are flagged.
