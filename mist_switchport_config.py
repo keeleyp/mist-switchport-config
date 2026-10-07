@@ -252,22 +252,35 @@ def render_vars(value, var_map):
     return re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: str(var_map.get(m.group(1), m.group(0))), value)
 
 
+MATCH_KEY = re.compile(r"^match_(\w+?)(?:\[(\d*):(\d*)\])?$")
+
+
 def rule_matches(rule, device):
     """A switch matching rule applies when every match_* condition holds; a rule
-    with no conditions matches everything. match_name/match_model compare the
-    rule value against that field starting at match_<x>_offset."""
+    with no conditions matches everything.
+
+    Conditions come in three forms:
+      match_role: "access"              - whole field must equal the value
+      match_name[9:17]: "SW48-001"      - that slice of the field must equal the value
+      match_name: "abc" + match_name_offset: 2 - older form: the field from the
+                                          offset onwards must start with the value
+    """
     for key, value in rule.items():
         if not key.startswith("match_") or key.endswith("_offset") or value in (None, ""):
             continue
-        field = key[len("match_"):]
+        m = MATCH_KEY.match(key)
+        if not m:
+            continue
+        field, start, end = m.groups()
         actual = str(device.get(field) or "")
-        if field == "role":
-            if actual.lower() != str(value).lower():
-                return False
-        else:
+        value = str(value)
+        if start is not None or end is not None:
+            actual = actual[int(start or 0):int(end) if end else None]
+        elif field != "role":
             offset = int(rule.get(f"{key}_offset") or 0)
-            if actual[offset:offset + len(str(value))].lower() != str(value).lower():
-                return False
+            actual = actual[offset:offset + len(value)]
+        if actual.lower() != value.lower():
+            return False
     return True
 
 
@@ -687,7 +700,10 @@ def main():
                     junos_check = "Not in Junos"
                 else:
                     junos_check = "OK" if junos_usage == row["usage"] else "MISMATCH"
-                if row["lag"] and junos_ae.get(row["port"]) and row["lag"] != junos_ae[row["port"]]:
+                if row["lag"] == "ae (auto)" and junos_ae.get(row["port"]):
+                    # No ae_idx configured - Mist picks one; show the one it chose.
+                    row["lag"] = f"{junos_ae[row['port']]} (auto)"
+                elif row["lag"] and junos_ae.get(row["port"]) and row["lag"] != junos_ae[row["port"]]:
                     junos_check = "MISMATCH (LAG)"
             counts[row["assign_source"]] += 1
             counts["overrides"] += bool(row["overrides"])
