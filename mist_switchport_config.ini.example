@@ -1,0 +1,42 @@
+[mist]
+org_id = YOUR_ORG_ID_HERE
+api_token = YOUR_API_TOKEN_HERE
+# Mist cloud the org lives on - matches the portal you log in to:
+#   api.mist.com (US / Global 01)  api.eu.mist.com (EU)  api.gc1.mist.com
+#   api.gc2.mist.com  api.gc3.mist.com (EMEA 02)  api.gc4.mist.com
+#   api.gc5.mist.com  api.gc6.mist.com  api.gc7.mist.com
+#   api.ac2.mist.com  api.ac5.mist.com  api.ac6.mist.com
+# Short forms (eu, gc3) and portal URLs (https://manage.eu.mist.com) also
+# work. Required.
+cloud = 
+
+[output]
+# Folder the Excel report is written to. Default: your home folder.
+directory = ~
+
+[validation]
+# Check the derived port profiles against the Junos config Mist actually
+# generates for each switch (one extra API call per switch checked).
+#   all  - check every switch (default)
+#   off  - skip the check
+#   25   - check that many switches, spread evenly across the org
+junos_check = all
+
+# Optional - only needed if you're behind a TLS-inspecting proxy (e.g.
+# Zscaler). Delete this whole section, or leave the values blank, to use
+# normal system defaults (certifi's CA store, and the HTTP_PROXY /
+# HTTPS_PROXY / NO_PROXY environment variables if set).
+[network]
+# Path to a PEM file with your proxy's root CA certificate (or a bundle
+# that includes it), so TLS verification succeeds against its inspected
+# connections. Most Zscaler deployments can export this from the client
+# app, or your IT team will have it.
+ca_bundle =
+# Only set this to false if you have no way to obtain the proxy's CA
+# certificate. This disables TLS certificate verification entirely and is
+# not recommended.
+verify_ssl = true
+# Explicit proxy overrides - usually unnecessary, since requests already
+# honors HTTP_PROXY / HTTPS_PROXY / NO_PROXY from the environment.
+http_proxy =
+https_proxy =
